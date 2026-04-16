@@ -1,0 +1,116 @@
+---
+title: Data Cleaning
+author: Reagan Tullis
+execute: 
+  cache: true
+---
+```{python}
+#| echo: False
+import pandas as pd
+import numpy as np
+```
+
+This page contains an overview of the data cleaning process for this sample analysis. Further information regarding the dataset can be found in data_info.md.  
+
+For this analysis, my goal will be to predict the Metacritic score of a game based on the features included in this dataset. A Metacritic score is a 0-100 rating of a video game's overall quality.  
+
+### Loading Data
+Data was loaded from a .json file and transposed to standard format using pandas.
+```{python}
+games_raw = pd.read_json("data/games.json")
+games_raw = games_raw.T
+```
+### Dropping Columns
+For the purposes of this analysis, I will not be using unstructured text or image data. Columns containing this type of information were dropped, along with others that would not be useful for analytical purposes. See comments for further justification.
+```{python}
+games_dropped = games_raw.drop(columns=["name", # ID variable
+                                        "detailed_description", # unstructured text
+                                        "about_the_game", # unstructured text
+                                        "short_description", # unstructured text
+                                        "reviews", # unstructured text
+                                        "header_image", # image data
+                                        "website", # high cardinality & sparse representation
+                                        "support_url", # high cardinality & sparse representation
+                                        "support_email", # high cardinality & sparse representation
+                                        "windows", # zero variance
+                                        "metacritic_url", # high cardinality & sparse representation
+                                        "notes", # unstructured text
+                                        "packages", # not comparable across games
+                                        "developers", # high cardinality & sparse representation
+                                        "publishers", # high cardinality & sparse representation
+                                        "screenshots", # image data
+                                        "movies", # zero variance
+                                        "user_score", # extreme missingness
+                                        "score_rank", # extreme missingness
+                                        "discount" # not reflective of historic data
+                                        ])
+```
+
+### Missingness & Filtering Rows
+This dataset does not contain any true missing values. Instead, 0 is a stand-in for missing values in numeric columns, and "" is a stand-in in string-valued columns. In most cases, this choice makes sense - "no achievements" and "zero achievements" mean the same thing - but in the case of `metacritic_score`, a real zero would indicate a bad score, so it is more appropriate to treat zeroes there as NAs. Furthermore, rows in which `metacritic_score == 0` lack an entry in the `metacritic_url` column, indicating that they were never reviewed by Metacritic. 
+
+As for the remainder of the columns still included in the dataframe, I have verified that a zero truly means zero. The one remaining categorical column - `estimated_owners` - does not contain any placeholder values.  
+
+Since `metacritic_score` is my target variable, I will be dropping rows in which `metacritic_score == 0`.  
+```{python}
+# drop all rows where the target variable is null
+games_dropped = games_dropped[games_dropped["metacritic_score"] != 0]
+```
+
+### Typing Features
+Due to the data being loaded from a `.json`, all features are initially typed as `object`. This had to be corrected manually.
+```{python}
+# sort features by desired type - this must be done manually
+num_features = ["required_age", 
+                "price",
+                "dlc_count", 
+                "metacritic_score", 
+                "achievements", 
+                "recommendations",
+                "positive",
+                "negative",
+                "average_playtime_forever",
+                "average_playtime_2weeks",
+                "median_playtime_forever",
+                "median_playtime_2weeks",
+                "peak_ccu"
+                ]
+
+bool_features = ["mac", "linux"]
+
+cat_features = ["estimated_owners"]
+
+datetime_features = ["release_date"]
+
+list_features = ["supported_languages",
+                 "full_audio_languages",
+                 "categories",
+                 "genres",
+                 "tags"
+                ]
+
+# type features appropriately
+
+# numerics
+for f in num_features:
+    games_dropped[f] = games_dropped[f].astype(float)
+
+# binary columns
+for f in bool_features:
+    games_dropped[f] = games_dropped[f].astype(int)
+
+# categories
+for f in cat_features:
+    games_dropped[f] = pd.Categorical(games_dropped[f])
+
+# datetimes
+for f in datetime_features:
+    games_dropped[f] = pd.to_datetime(games_dropped[f])
+```  
+### Multi-Hot Encoding
+A number of columns (those included in `list_columns` above) contain a list of values. For instance, a value of `supported_languages` may be `[English, Spanish]`. These will need to be multi-hot encoded before I can use them in an analysis, but doing so now would introduce information leakage, so this will be handled in the preprocessing pipeline.
+
+With the data cleaning complete for now, I opted to save this cleaned dataframe as a `.csv` for ease of use later on.
+```{python}
+games_dropped.to_csv("data/games_clean.csv")
+```
