@@ -7,7 +7,7 @@ execute:
 ```{python}
 #| echo: False
 import pandas as pd
-import numpy as np
+from sklearn.preprocessing import MultiLabelBinarizer
 ```
 
 This page contains an overview of the data cleaning process for this sample analysis. Further information regarding the dataset can be found in data_info.md.  
@@ -85,32 +85,68 @@ datetime_features = ["release_date"]
 list_features = ["supported_languages",
                  "full_audio_languages",
                  "categories",
-                 "genres",
-                 "tags"
+                 "genres"
                 ]
 
+dict_features = ["tags"]
+
 # type features appropriately
+games_typed= games_dropped.copy()
 
 # numerics
 for f in num_features:
-    games_dropped[f] = games_dropped[f].astype(float)
+    games_typed[f] = games_typed[f].astype(float)
 
 # binary columns
 for f in bool_features:
-    games_dropped[f] = games_dropped[f].astype(int)
+    games_typed[f] = games_typed[f].astype(int)
 
 # categories
 for f in cat_features:
-    games_dropped[f] = pd.Categorical(games_dropped[f])
+    games_typed[f] = pd.Categorical(games_typed[f])
 
 # datetimes
 for f in datetime_features:
-    games_dropped[f] = pd.to_datetime(games_dropped[f])
+    games_typed[f] = pd.to_datetime(games_typed[f])
+    games_typed[str(f) + "_year"] = games_typed[f].dt.year
+    games_typed[str(f) + "_month"] = games_typed[f].dt.month
+    games_typed[str(f) + "_day"] = games_typed[f].dt.day
+
+# dict columns
+for f in dict_features:
+    # an empty list is used as a placeholder for games with no tags
+    # so we can fill those in with an empty dict to be consistent with the rest of the column
+    games_typed[f] = games_typed[f].apply(lambda x: {} if x == [] else x)
+    f_expanded = pd.json_normalize(games_typed[f])
+    # add prefix
+    f_expanded = f_expanded.add_prefix(f + "_")
+    # align index with original dataframe
+    f_expanded.index = games_dropped.index
+    # concatenate with original dataframe
+    games_typed = pd.concat([games_typed, f_expanded], axis=1)
+    # drop original dict column
+    games_typed = games_typed.drop(columns=[f])
+
+# fill NaNs created by empty dicts with 0s - this is appropriate since a missing tag is equivalent to a tag with a value of 0
+games_typed = games_typed.fillna(0)
+# (note that we had no NaNs in the original dataframe, so any NaNs in games_typed were created by the dict expansion process)
 ```  
 ### Multi-Hot Encoding
-A number of columns (those included in `list_columns` above) contain a list of values. For instance, a value of `supported_languages` may be `[English, Spanish]`. These will need to be multi-hot encoded before I can use them in an analysis, but doing so now would introduce information leakage, so this will be handled in the preprocessing pipeline.
+A number of columns (those included in `list_columns` above) contain a list of values. For instance, a value of `supported_languages` may be `["English", "Spanish"]`. These will need to be multi-hot encoded before I can use them in an analysis.
+
+```{python}
+games_encoded = games_typed.copy()
+for f in list_features:
+    mlb = MultiLabelBinarizer()
+    transformed = mlb.fit_transform(games_typed[f])
+    transformed_df = pd.DataFrame(transformed, columns=[f + "_" + str(c) for c in mlb.classes_], index=games_typed.index)
+    games_encoded = pd.concat([games_encoded, transformed_df], axis=1)
+    # drop original column
+    games_encoded = games_encoded.drop(columns=[f])
+
+```
 
 With the data cleaning complete for now, I opted to save this cleaned dataframe as a `.csv` for ease of use later on.
 ```{python}
-games_dropped.to_csv("data/games_clean.csv")
+games_encoded.to_csv("data/games_clean.csv")
 ```
