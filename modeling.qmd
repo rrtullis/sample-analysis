@@ -1,0 +1,495 @@
+---
+title: Model Iteration
+author: Reagan Tullis
+execute: 
+  cache: true
+---
+
+```{python}
+#| echo: false
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, cross_validate, RepeatedKFold, GridSearchCV, RandomizedSearchCV
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, MaxAbsScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, root_mean_squared_error
+from sklearn.decomposition import TruncatedSVD
+import pickle
+
+```
+
+## Modeling
+### Baseline Models
+For my modeling process, I began with running a simple repeated five-fold cross validation using untuned models of various forms. Linear models like Lasso performed poorly, with metrics only slightly better than a mean-strategy dummy regressor. KNN also performed poorly, likely due to the high dimensionality of the data and the sparsity of most binary columns.
+
+The models that ended up having any notable advantage over the dummy regressor were both ensemble tree methods - the Random Forest and the XGBoost Regressor. While a single decison tree performed exceptionally poorly, both of these ensemble methods showed significant improvement over the dummy regressor.
+
+An overview of untuned model performance is shown below. The code for each of these models can be found in the GitHub repository.
+
+#### Untuned Model Performance
+|Model|RMSE|R2|
+|-|-|-|
+|Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
+| Untuned Lasso | 9.8811 | 0.0717 |
+| KNN-5 | 10.0834 | 0.02752 |
+| Untuned Decision Tree | 10.7124 | -0.0975 |
+| Untuned Random Forest | 7.6184 | 0.4479 |
+| Untuned XGBoost Regressor | 7.6498 | 0.4420 |
+
+### Model Iteration
+Based off of the cross-validation results of the initial models, I chose to focus my efforts on tuning and improving both a Random Forest and XGBoost model. An overview of the tuned models' performance is shown in the table below.
+
+#### Model Performance Overview
+|Model|RMSE|R2|
+|-|-|-|
+|Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
+|Random Forest| 7.5385 | 0.4615 |
+|XGBoost | 7.4013 | 0.4809 |
+|Random Forest with 90% TruncatedSVD | 7.8614 | 0.4144 |
+|XGBoost with 90% TruncatedSVD | 7.5237 | 0.4636 |
+|XGBoost (Additional Tuning) | 7.3130 | 0.4932 |
+
+### Iteration 1: Tuning
+I began by doing some modest tuning on my prexisting baseline Random Forest and XGBoost Models. This required loading the data from `games_clean.csv` and doing some minor preprocessing to prepare it to be used by my pipelines.
+```{python}
+# load data
+games = pd.read_csv("data/games_clean.csv")
+games = games.drop(columns=["Unnamed: 0"]) # drop index column created by pandas when saving to csv
+
+# fix typings
+# convert datetime to unix timestamp
+games["release_date"] = pd.to_datetime(games["release_date"], errors="coerce")
+games["release_date"] = games["release_date"].astype("int64") // 10**9 # convert from nanoseconds to seconds
+games["release_date"] = games["release_date"].astype("float64")
+
+# convert estimated_owners to ordered categorical
+games["estimated_owners"] = pd.Categorical(games["estimated_owners"],
+                                           categories=["0 - 0",
+                                                  "0 - 20000",
+                                                  "20000 - 50000",
+                                                  "50000 - 100000",
+                                                  "100000 - 200000",
+                                                  "200000 - 500000",
+                                                  "500000 - 1000000",
+                                                  "1000000 - 2000000",
+                                                  "2000000 - 5000000",
+                                                  "5000000 - 10000000",
+                                                  "10000000 - 20000000",
+                                                  "20000000 - 50000000",
+                                                  "50000000 - 100000000",
+                                                  "100000000 - 200000000"
+                                                ], 
+                                           ordered=True)
+```
+
+I followed the typical workflow of separating features into lists that would need to be processed in different ways according to their type.
+```{python}
+# general feature categorization
+ord_features = ["estimated_owners"]
+nom_features = games.select_dtypes(include=["int32", "int64"]).drop(columns=["release_date_month", 
+                                                                             "release_date_year"]).columns.tolist()
+
+date_features = ["release_date_year", "release_date_month"]
+num_features = games.select_dtypes(include=["float64"]).drop(columns=["metacritic_score"]).columns.tolist() + date_features
+
+features = ord_features + nom_features + num_features
+target = "metacritic_score"
+```
+
+I also split the data into training and test sets, and set up a `RepeatedKFold` object to be used during cross validation.
+```{python}
+# split data 
+games_train, games_test = train_test_split(
+    games,
+    test_size=0.2,
+    random_state=4025
+)
+
+rkf = RepeatedKFold(n_splits=5, n_repeats=3, random_state=4025)
+
+```
+
+Since both models I was planning to tune were based on decision trees, I used the same preprocessing pipeline for both of them.
+```{python}
+# general decision tree preprocessing pipeline
+dt_ord_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ordinal_encoder", OrdinalEncoder())
+])
+
+dt_nom_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot_encoder", OneHotEncoder(handle_unknown="ignore", drop="if_binary")),
+    ("variance_threshold", VarianceThreshold(threshold=0.01))
+])
+
+dt_num_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="median"))
+])
+
+dt_prep = ColumnTransformer([
+    ("ord", dt_ord_prep, ord_features),
+    ("nom", dt_nom_prep, nom_features),
+    ("num", dt_num_prep, num_features)
+])
+```
+
+
+#### Random Forest Tuning
+My random forest tuning grid is shown below. I chose to use an exhaustive grid search since I focused on tuning only `max_features`.
+```{python}
+# initial random forest pipeline & tuning grid
+rf_pipe = Pipeline([
+    ("preprocessor", dt_prep),
+    ("model", RandomForestRegressor(random_state=4025))
+])
+
+rf_param_grid = {"model__max_features": np.linspace(350, 425, 25, dtype=int)}
+                # note that this parameter grid was initially much wider
+                # I narrowed it to the current range after determining it was the optimal area
+                # over multiple tuning iterations
+
+rf_grid_search = GridSearchCV(
+    rf_pipe,
+    rf_param_grid,
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"],
+    refit="neg_mean_squared_error",
+    n_jobs=-1
+)
+
+try: 
+    best_rf = pickle.load(open("saved_objects/rf.pkl", "rb"))
+except FileNotFoundError:
+    rf_grid_search.fit(games_train[features], games_train[target])
+    best_rf = rf_grid_search.best_estimator_
+    best_rf.fit(games_train[features], games_train[target])
+
+rf_preds = best_rf.predict(games_test[features])
+rf_r2 = r2_score(games_test[target], rf_preds)
+rf_rmse = root_mean_squared_error(games_test[target], rf_preds)
+print("Random Forest R2:", rf_r2)
+print("Random Forest RMSE:", rf_rmse)
+```
+
+This tuning led to a slight improvement over the original Random Forest.
+
+#### XGBoost Tuning
+My XGBoost tuning grid is shown below. I opted to use a randomized search due to number and range of my chosen tuning parameters. 
+```{python}
+# initial XGB pipeline & tuning grid
+xgb_pipe = Pipeline([
+    ("preprocessor", dt_prep),
+    ("model", XGBRegressor())
+])
+
+xgb_param_grid = {
+    "model__n_estimators": np.linspace(50, 1000, 20, dtype=int),
+    "model__max_depth": list(np.linspace(3, 10, 8, dtype=int)) + [None],
+    "model__learning_rate": np.logspace(-3, 0, 10)
+}
+
+xgb_random_search = RandomizedSearchCV(
+    xgb_pipe,
+    xgb_param_grid,
+    n_iter=100,
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"],
+    refit="neg_mean_squared_error",
+    n_jobs=-1,
+    random_state=4025
+)
+
+try:
+    best_xgb = pickle.load(open("saved_objects/xgb.pkl", "rb"))
+except FileNotFoundError:
+    xgb_random_search.fit(games_train[features], games_train[target])
+    best_xgb=xgb_random_search.best_estimator_
+    best_xgb.fit(games_train[features], games_train[target])
+
+xgb_preds = best_xgb.predict(games_test[features])
+xgb_r2 = r2_score(games_test[target], xgb_preds)
+xgb_rmse = root_mean_squared_error(games_test[target], xgb_preds)
+print("XGBoost R2:", xgb_r2)
+print("XGBoost RMSE:", xgb_rmse)
+```
+
+This tuning led to a modest improvement over the original XGBoost Regressor.
+
+### Iteration 2: TruncatedSVD
+While the performance metrics of my models were significantly better than the dummy regressor, I felt that they could still be improved. My dataset had a large number of features, clocking in at over 700 in total, and so I thought that using PCA or a similar method to collapse those features into a more reasonable amount might improve my performance. I had originally intended to use PCA for this, but during my implementation of it I came across sklearn's `TruncatedSVD`, which was better suited to the sparse binary data that made up most of my dataset.
+
+Implementing this method required changes to my feature lists and pipeline. To avoid any potential overlap with previously created objects, I opted to work off of a copy of the `games` dataset. The modified preprocessing is shown below.
+
+```{python}
+games_pca = games.copy()
+
+lang_cols = games_pca.filter(like="supported_languages_").columns.tolist()
+audio_cols = games_pca.filter(like="full_audio_languages_").columns.tolist()
+cat_cols = games_pca.filter(like="categories_").columns.tolist()
+genre_cols = games_pca.filter(like="genres_").columns.tolist()
+tag_cols = games_pca.filter(like="tags_").columns.tolist()
+
+all_cluster_cols = lang_cols + audio_cols + cat_cols + genre_cols + tag_cols
+
+pca_ord_features = ["estimated_owners"]
+pca_nom_features = ["mac", "linux"]
+pca_num_features = ["release_date",
+                    "required_age",
+                    "price",
+                    "dlc_count",
+                    "achievements",
+                    "recommendations",
+                    "positive",
+                    "negative",
+                    "average_playtime_forever",
+                    "median_playtime_forever",
+                    "peak_ccu",
+                    "release_date_year", 
+                    "release_date_month"]
+
+pca_features = pca_ord_features + pca_nom_features + pca_num_features + all_cluster_cols
+target = "metacritic_score"
+
+pca_games_train, pca_games_test = train_test_split(
+    games_pca,
+    test_size=0.2,
+    random_state=4025
+)
+```
+
+To use `TruncatedSVD` properly, I had to specify the number of components I wanted it to create from each feature group. I did this by executing the following code for each relevant feature group, and noting which values captured 85% and 90% of variance in the group.
+
+```{python}
+#| eval: false
+svd = TruncatedSVD(n_components=x, random_state=4025)
+svd.fit(games_pca[cols])
+print(svd.explained_variance_ratio_.cumsum())
+```
+
+Number of components required to achieve 85%, 95% of variance capture, per feature
+|feature | n_components .85 | n_components .9 |
+|-|-|-|
+|lang | 13 | 16 |
+|audio | 11 | 14 |
+|categories | 18 | 24 |
+|genres | 6 | 7 |
+|tags | 6 | 11 |
+
+I also implemented functions that would allow me to easily insert pipelines with the proper parameters into my workflow.
+```{python}
+def binary_processor(n_components):
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("threshold", VarianceThreshold(threshold=0.01)),
+        ("svd", TruncatedSVD(n_components=n_components, random_state=4025))
+    ])
+
+def tag_processor(n_components):
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", MaxAbsScaler()),
+        ("svd", TruncatedSVD(n_components=n_components, random_state=4025))
+    ])
+```
+
+I tested both 85% and 90% variance `n_components` with simple cross-validation.
+```{python}
+pca_dt_prep_85 = ColumnTransformer([
+    ("ord", dt_ord_prep, pca_ord_features),
+    ("nom", dt_nom_prep, pca_nom_features),
+    ("num", dt_num_prep, pca_num_features),
+    ("lang", binary_processor(13), lang_cols),
+    ("audio", binary_processor(11), audio_cols),
+    ("cat", binary_processor(18), cat_cols),
+    ("genre", binary_processor(6), genre_cols),
+    ("tag", tag_processor(6), tag_cols)
+])
+
+pca_dt_prep_90 = ColumnTransformer([
+    ("ord", dt_ord_prep, pca_ord_features),
+    ("nom", dt_nom_prep, pca_nom_features),
+    ("num", dt_num_prep, pca_num_features),
+    ("lang", binary_processor(16), lang_cols),
+    ("audio", binary_processor(14), audio_cols),
+    ("cat", binary_processor(24), cat_cols),
+    ("genre", binary_processor(7), genre_cols),
+    ("tag", tag_processor(11), tag_cols)
+])
+
+pca_rf_85_pipe = Pipeline([
+    ("preprocessor", pca_dt_prep_85),
+    ("model", RandomForestRegressor(random_state=4025))
+])
+
+pca_rf_90_pipe = Pipeline([
+    ("preprocessor", pca_dt_prep_90),
+    ("model", RandomForestRegressor(random_state=4025))
+])
+
+pca_xgb_85_pipe = Pipeline([
+    ("preprocessor", pca_dt_prep_85),
+    ("model", XGBRegressor())
+])
+
+pca_xgb_90_pipe = Pipeline([
+    ("preprocessor", pca_dt_prep_90),
+    ("model", XGBRegressor())
+])
+
+```
+
+```{python}
+#| eval: false
+pca_rf_85_cv_results = cross_validate(
+    pca_rf_85_pipe,
+    pca_games_train[pca_features],
+    pca_games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+pca_rf_90_cv_results = cross_validate(
+    pca_rf_90_pipe,
+    pca_games_train[pca_features],
+    pca_games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+pca_xgb_85_cv_results = cross_validate(
+    pca_xgb_85_pipe,
+    pca_games_train[pca_features],
+    pca_games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+pca_xgb_90_cv_results = cross_validate(
+    pca_xgb_90_pipe,
+    pca_games_train[pca_features],
+    pca_games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+```
+
+I decided to tune the models using the 90% variance values, since models using those performed better in simple cross-validation.
+
+```{python}
+# SVD Random Forest tuning
+pca_rf_param_grid = {"model__max_features": np.linspace(1, 88, 25, dtype=int)}
+
+pca_rf_gs = GridSearchCV(
+    pca_rf_90_pipe,
+    pca_rf_param_grid,
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"],
+    refit="neg_mean_squared_error",
+    n_jobs=-1
+)
+
+try: 
+    pca_best_rf = pickle.load(open("saved_objects/sdv_rf.pkl", "rb"))
+except FileNotFoundError:
+    pca_rf_gs.fit(pca_games_train[pca_features], pca_games_train[target])
+    pca_best_rf = pca_rf_gs.best_estimator_
+    pca_best_rf.fit(pca_games_train[pca_features], pca_games_train[target])
+
+pca_rf_preds = pca_best_rf.predict(pca_games_test[pca_features])
+pca_rf_r2 = r2_score(pca_games_test[target], pca_rf_preds)
+pca_rf_rmse = root_mean_squared_error(pca_games_test[target], pca_rf_preds)
+print("PCA Random Forest R2:", pca_rf_r2)
+print("PCA Random Forest RMSE:", pca_rf_rmse)
+
+# SVD XGBoost tuning
+pca_xgb_param_grid = {
+    "model__n_estimators": np.linspace(50, 1000, 20, dtype=int),
+    "model__max_depth": list(np.linspace(1, 10, 8, dtype=int)) + [None],
+    "model__learning_rate": np.logspace(-3, 0, 10)
+}
+
+pca_xgb_rs = RandomizedSearchCV(
+    pca_xgb_90_pipe,
+    pca_xgb_param_grid,
+    n_iter=100,
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"],
+    refit="neg_mean_squared_error",
+    n_jobs=-1,
+    random_state=4025
+)
+
+try: 
+    pca_best_xgb = pickle.load(open("saved_objects/sdv_xgb.pkl", "rb"))
+except FileNotFoundError:
+    pca_xgb_rs.fit(pca_games_train[pca_features], pca_games_train[target])
+    pca_best_xgb = pca_xgb_rs.best_estimator_
+    pca_best_xgb.fit(pca_games_train[pca_features], pca_games_train[target])
+
+pca_xgb_preds = pca_best_xgb.predict(pca_games_test[pca_features])
+pca_xgb_r2 = r2_score(pca_games_test[target], pca_xgb_preds)
+pca_xgb_rmse = root_mean_squared_error(pca_games_test[target], pca_xgb_preds)
+print("PCA XGBoost R2:", pca_xgb_r2)
+print("PCA XGBoost RMSE:", pca_xgb_rmse)
+```
+
+Unfortunately, this approach did not improve my metrics - it actually worsened them a bit. 
+
+Additionally, while not shown here, I did try models on a dataset that simply did not include the columns that I attempted SVD on. These models also showed a slight decrease in performance compared to the original tuned iteration.
+
+### Iteration 3: Extended XGB Tuning
+For what would become the final notable iteration, I decided to expand the tuning parameter grid of my original XGBoost model to cover additional parameters. This involved a return to the original dataset and feature lists.
+
+```{python}
+new_xgb_param_grid = {
+    "model__n_estimators": np.linspace(300, 1500, 20, dtype=int),
+    "model__max_depth": [3, 4, 5, 6, 8],
+    "model__learning_rate": np.logspace(-2.5, -0.5, 10),
+
+    # 'randomness' parameters
+    "model__subsample": np.linspace(0.6, 1.0, 5), # proportion of observations available to each tree
+    "model__colsample_bytree": np.linspace(0.3, 1.0, 8), # proportion of columns available to each tree
+
+    # split allowance parameters
+    "model__min_child_weight": [1, 3, 5, 10], # minimum number of samples required in a leaf
+    "model__gamma": [0, 0.1, 0.3, 1], # minimum reduction in loss required to split
+
+    # regularization parameters
+    "model__reg_alpha": np.logspace(-3, 1, 10), # encourages sparsity in leaves
+    "model__reg_lambda": np.logspace(-2, 2, 10), # shrinks leaf weights 
+}
+
+new_xgb_rs = RandomizedSearchCV( 
+    xgb_pipe,
+    new_xgb_param_grid,
+    n_iter=200,
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"],
+    refit="neg_mean_squared_error",
+    n_jobs=-1,
+    random_state=4025
+)
+
+try: 
+    new_best_xgb = pickle.load(open("saved_objects/tuned_xgb.pkl", "rb"))
+except FileNotFoundError:
+    new_xgb_rs.fit(games_train[features], games_train[target])
+    new_best_xgb = new_xgb_rs.best_estimator_
+    new_best_xgb.fit(games_train[features], games_train[target])
+
+new_xgb_preds = new_best_xgb.predict(games_test[features])
+new_xgb_r2 = r2_score(games_test[target], new_xgb_preds)
+new_xgb_rmse = root_mean_squared_error(games_test[target], new_xgb_preds)
+print("New XGBoost R2:", new_xgb_r2)
+print("New XGBoost RMSE:", new_xgb_rmse)
+```
+
+This extra tuning, while very expensive both in terms of time and computation, provided a modest increase to the performance of my what would become my final model. While the metrics still aren't impressive, they have improved a reasonable amount from where I started.
