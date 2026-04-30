@@ -1,0 +1,284 @@
+## Initial Models
+This file contains the pipelines and cross-validation processes for the initial untuned models I applied to this database. For reference, the table below contains the cross-validation performance of these baseline models.
+
+|Model|RMSE|R2|
+|-|-|-|
+|Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
+| Untuned Lasso | 9.8811 | 0.0717 |
+| KNN-5 | 10.0834 | 0.02752 |
+| Untuned Decision Tree | 10.7124 | -0.0975 |
+| Untuned Random Forest | 7.6184 | 0.4479 |
+| Untuned XGBoost Regressor | 7.6498 | 0.4420 |
+
+### General Preprocessing
+Though the data was cleaned in previous steps, there remains some general preprocessing that must be done when loading the data from `games_clean.csv`.
+
+```{python}
+#| echo: false
+#| excecute: false
+import pandas as pd
+import numpy as np
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, cross_validate, RepeatedKFold, GridSearchCV, RandomizedSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, OrdinalEncoder, MaxAbsScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Lasso
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import r2_score, root_mean_squared_error
+from sklearn.decomposition import TruncatedSVD
+from sklearn.dummy import DummyRegressor
+```
+
+```{python}
+#| eval: false
+# load data
+games = pd.read_csv("data/games_clean.csv")
+games = games.drop(columns=["Unnamed: 0"]) # drop index column created by pandas when saving to csv
+
+# fix typings
+# convert datetime to unix timestamp
+games["release_date"] = pd.to_datetime(games["release_date"], errors="coerce")
+games["release_date"] = games["release_date"].astype("int64") // 10**9 # convert from nanoseconds to seconds
+games["release_date"] = games["release_date"].astype("float64")
+
+# convert estimated_owners to ordered categorical
+games["estimated_owners"] = pd.Categorical(games["estimated_owners"],
+                                           categories=["0 - 0",
+                                                  "0 - 20000",
+                                                  "20000 - 50000",
+                                                  "50000 - 100000",
+                                                  "100000 - 200000",
+                                                  "200000 - 500000",
+                                                  "500000 - 1000000",
+                                                  "1000000 - 2000000",
+                                                  "2000000 - 5000000",
+                                                  "5000000 - 10000000",
+                                                  "10000000 - 20000000",
+                                                  "20000000 - 50000000",
+                                                  "50000000 - 100000000",
+                                                  "100000000 - 200000000"
+                                                ], 
+                                           ordered=True)                                     
+```
+
+The next step is separating our general feature lists for use in numeric or categorical-specific pipelines. Previously, I intentonally stored all binary nominal features as integers to make this easier.
+
+```{python}
+#| eval: false
+ord_features = ["estimated_owners"]
+nom_features = games.select_dtypes(include=["int32", "int64"]).drop(columns=["release_date_month", 
+                                                                             "release_date_year"]).columns.tolist()
+cat_features = ord_features + nom_features
+
+date_features = ["release_date_year", "release_date_month"]
+num_features = games.select_dtypes(include=["float64"]).drop(columns=["metacritic_score"]).columns.tolist() + date_features
+
+features = cat_features + num_features
+target = "metacritic_score"
+```
+
+Lastly, I split the `games` into training and test sets, and set up a `RepeatedKFold` object for upcoming cross validation.
+
+```{python}
+#| eval: false
+games_train, games_test = train_test_split(
+    games,
+    test_size=0.2,
+    random_state=4025
+)
+
+rkf = RepeatedKFold(n_splits=5, n_repeats=3, random_state=4025)
+```
+
+### Dummy Regressor
+As a baseline, I created a dummy regressor to compare potential models to. Its performance, along with that of all other models, can be seen in the table at the top of this page.
+```{python}
+#| eval: false
+base = DummyRegressor(strategy="mean")
+base.fit(games_train[features], games_train[target])
+base_preds = base.predict(games_test[features])
+base_r2 = r2_score(games_test[target], base_preds)
+base_rmse = root_mean_squared_error(games_test[target], base_preds)
+```
+
+### Linear Models
+All linear models used the same preprocessing pipeline, shown below:
+```{python}
+#| eval: false
+lr_ord_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ordinal_encoder", OrdinalEncoder())
+])
+
+lr_nom_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot_encoder", OneHotEncoder(handle_unknown="ignore", drop="if_binary")),
+    ("variance_threshold", VarianceThreshold(threshold=0.01))
+])
+
+lr_num_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+lr_prep = ColumnTransformer([
+    ("ord", lr_ord_prep, ord_features),
+    ("nom", lr_nom_prep, nom_features),
+    ("num", lr_num_prep, num_features)
+])
+```
+
+#### Lasso
+Lasso cross-validation is shown below:
+```{python}
+#| eval: false
+lasso_pipe = Pipeline([
+    ("preprocessor", lr_prep),
+    ("model", Lasso())
+])
+
+lasso_cv_results = cross_validate(
+    lasso_pipe,
+    games_train[features],
+    games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+```
+
+### K-Nearest Neighbors
+The KNN preprocessing pipeline is shown below:
+```{python}
+#| eval: false
+knn_ord_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ordinal_encoder", OrdinalEncoder())
+])
+
+knn_nom_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot_encoder", OneHotEncoder(handle_unknown="ignore", drop="if_binary")),
+    ("variance_threshold", VarianceThreshold(threshold=0.01))
+])
+
+knn_num_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+knn_prep = ColumnTransformer([
+    ("ord", knn_ord_prep, ord_features),
+    ("nom", knn_nom_prep, nom_features),
+    ("num", knn_num_prep, num_features)
+])
+
+```
+
+KNN cross-validation is shown below:
+
+```{python}
+#| eval: false
+knn_pipe = Pipeline([
+    ("preprocessor", knn_prep),
+    ("model", KNeighborsRegressor())
+])
+
+knn_cv_results = cross_validate(
+    knn_pipe,
+    games_train[features],
+    games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+```
+
+### Tree-Based Models
+The tree-based model preprocessing pipeline is shown below:
+
+```{python}
+#| eval: false
+dt_ord_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ordinal_encoder", OrdinalEncoder())
+])
+
+dt_nom_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot_encoder", OneHotEncoder(handle_unknown="ignore", drop="if_binary")),
+    ("variance_threshold", VarianceThreshold(threshold=0.01))
+])
+
+dt_num_prep = Pipeline([
+    ("imputer", SimpleImputer(strategy="median"))
+])
+
+dt_prep = ColumnTransformer([
+    ("ord", dt_ord_prep, ord_features),
+    ("nom", dt_nom_prep, nom_features),
+    ("num", dt_num_prep, num_features)
+])
+
+```
+
+#### Decision Tree
+Decision Tree cross-validation is shown below:
+```{python}
+#| eval: false
+dt_pipe = Pipeline([
+    ("preprocessor", dt_prep),
+    ("model", DecisionTreeRegressor())
+])
+
+dt_cv_results = cross_validate(
+    dt_pipe,
+    games_train[features],
+    games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+```
+
+#### Random Forest
+Random Forest cross-validation is shown below:
+```{python}
+#| eval: false
+rf_pipe = Pipeline([
+    ("preprocessor", dt_prep),
+    ("model", RandomForestRegressor(random_state=4025))
+])
+
+rf_cv_results = cross_validate(
+    rf_pipe,
+    games_train[features],
+    games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+```
+
+#### XGBoost Regressor
+XGBoost cross-validation is shown below:
+```{python}
+#| eval: false
+xgb_pipe = Pipeline([
+    ("preprocessor", dt_prep),
+    ("model", XGBRegressor())
+])
+
+xgb_cv_results = cross_validate(
+    xgb_pipe,
+    games_train[features],
+    games_train[target],
+    cv=rkf,
+    scoring=["neg_mean_squared_error", "r2"]
+)
+
+```
