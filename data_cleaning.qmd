@@ -34,6 +34,8 @@ games_dropped = games_raw.drop(columns=["name", # ID variable
                                         "support_email", # high cardinality & sparse representation
                                         "windows", # zero variance
                                         "metacritic_url", # high cardinality & sparse representation
+                                        "average_playtime_2weeks", # not reflective of historic data
+                                        "median_playtime_2weeks", # not reflectivve of historic data
                                         "notes", # unstructured text
                                         "packages", # not comparable across games
                                         "developers", # high cardinality & sparse representation
@@ -70,9 +72,7 @@ num_features = ["required_age",
                 "positive",
                 "negative",
                 "average_playtime_forever",
-                "average_playtime_2weeks",
                 "median_playtime_forever",
-                "median_playtime_2weeks",
                 "peak_ccu"
                 ]
 
@@ -110,7 +110,6 @@ for f in datetime_features:
     games_typed[f] = pd.to_datetime(games_typed[f])
     games_typed[str(f) + "_year"] = games_typed[f].dt.year
     games_typed[str(f) + "_month"] = games_typed[f].dt.month
-    games_typed[str(f) + "_day"] = games_typed[f].dt.day
 
 # dict columns
 for f in dict_features:

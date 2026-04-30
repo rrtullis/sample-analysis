@@ -43,10 +43,10 @@ Martin Bustos Roman (2022). *Steam Games Dataset*. Kaggle.
 | negative | Number of negative SteamSpy user votes | int | Y |
 | estimated_owners |Interval estimate of the number of people who own the game on Steam |category | Y |
 | average_playtime_forever | Average total playtime (hours) of game owners | int | Y |
-| average_playtime_2weeks | Average playtime (hours) of game owners over the last 2 weeks | int | Y |
+| average_playtime_2weeks | Average playtime (hours) of game owners over the last 2 weeks | int | N |
 | median_playtime_forever | Median total playtime (hours) of game owners | int | Y |
-| median_playtime_2weeks | Median playtime (hours) of game owners over the last 2 weeks | int | Y |
+| median_playtime_2weeks | Median playtime (hours) of game owners over the last 2 weeks | int | N |
 | discount | The current discount percentage of the game | int | N |
 | peak_ccu | The highest recorded number of concurrent players | int | N |
-| tags | List of tags users have applied to the game | list of str | Y |
+| tags | Dictionary of tags users have applied to the game & their frequency | dict | Y |
 
