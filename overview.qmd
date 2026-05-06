@@ -1,0 +1,121 @@
+---
+title: Predicting Metacritic Scores from Steam Data
+author: Reagan Tullis
+---
+```{python}
+#| echo: false
+import pandas as pd
+import plotnine as p9
+```
+
+```{python}
+#| echo: false
+# load data
+games = pd.read_csv("data/games_clean.csv")
+games = games.drop(columns=["Unnamed: 0"]) # drop index column created by pandas when saving to csv
+
+# fix typings
+# convert datetime to unix timestamp
+games["release_date"] = pd.to_datetime(games["release_date"], errors="coerce")
+games["release_date"] = games["release_date"].astype("int64") // 10**9 # convert from nanoseconds to seconds
+games["release_date"] = games["release_date"].astype("float64")
+
+# convert estimated_owners to ordered categorical
+games["estimated_owners"] = pd.Categorical(games["estimated_owners"],
+                                           categories=["0 - 0",
+                                                  "0 - 20000",
+                                                  "20000 - 50000",
+                                                  "50000 - 100000",
+                                                  "100000 - 200000",
+                                                  "200000 - 500000",
+                                                  "500000 - 1000000",
+                                                  "1000000 - 2000000",
+                                                  "2000000 - 5000000",
+                                                  "5000000 - 10000000",
+                                                  "10000000 - 20000000",
+                                                  "20000000 - 50000000",
+                                                  "50000000 - 100000000",
+                                                  "100000000 - 200000000"
+                                                ], 
+                                           ordered=True)
+games=games.copy()
+```
+
+## Dataset
+The data used in this analysis was sourced from [Kaggle](https://www.kaggle.com/ds/2109585). It contains information fetched from Steam's API and supplemental information from SteamSpy. Steam is a major platform for PC gaming, and holds an ~70% market share of the area. A full overview of the `games` dataset, with information on its features, can be found in `data_info.md`.
+
+The goal for this analysis was to predict the Metacritic score of a game. Metacritic is an American website that rates, TV shows, movies, and video games on a scale of 0-100. The distribution of Metacritic scores in this database is shown below.
+
+```{python}
+#| echo: false
+(
+    p9.ggplot(games, p9.aes(x="metacritic_score")) +
+    p9.geom_histogram(bins=25) +
+    p9.labs(x="Metacritic Score", y="Frequency", title="Frequency Distribution of Metacritic Score") +
+    p9.theme_minimal()
+)
+```
+
+The scores present in this database range from 6 to 97, with a mean of ~73.9 and a standard deviation of ~10.3. The distribution is somewhat left-skewed, but I opted not to transform `metacritic_score`, as I wanted my model's predictions to be interpretable as the actual predicted score, rather than a transformation of the score.
+
+## Data Cleaning
+The data used in this analysis was loaded from a `.json` and required extensive cleaning before it could be used. This cleaning involved manually typing each feature appropriately, dealing with placeholder missing values, and dropping any columns that wouldn't be useful for analysis. A full walkthrough of this process can be found in `data_cleaning.qmd`.
+
+The main event for data cleaning came when dealing with five columns in particular: `supported_languages`, `full_audio_languages`, `genres`, and `categories` all contained lists of strings, and `tags` contained dictionaries. In order to convert these columns to a usuable format for analysis, I used sklearn's `MultiLabelBinarizer` to convert the list columns to a set of binary columns, where a 1 in a given column (e.g., supported_languages_English) would indicate that, for instance, the game supports the English language.  
+
+```{python}
+#| eval: false
+games_encoded = games_typed.copy()
+for f in list_features:
+    mlb = MultiLabelBinarizer()
+    transformed = mlb.fit_transform(games_typed[f]) # generate binary columns
+    # convert to DataFrame & apply prefixes
+    transformed_df = pd.DataFrame(transformed, columns=[f + "_" + str(c) for c in mlb.classes_], index=games_typed.index)
+    games_encoded = pd.concat([games_encoded, transformed_df], axis=1)
+    # drop original column
+    games_encoded = games_encoded.drop(columns=[f])
+```
+
+As for `tags`, I used pandas' `json_normalize` method to achieve a similar result, with the main difference that the added columns and values corresponded to key-value pairs in the dictionary. The final dataset that I used to train my models on had 4256 rows and 757 columns.
+
+## EDA
+
+## Initial Models
+To begin the modeling phase, I performed a simple repeated K-fold cross validation of a number of basic, untuned models that used sklearn's and XGBoost's default parameters. The full preprocessing pipeline and code for each of these models can be found in `modeling.qmd`. An overview of their initial results is shown below.
+
+|Model|Mean RMSE|Mean R2|
+|-|-|-|
+|Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
+| Untuned Lasso | 9.8811 | 0.0717 |
+| KNN-5 | 10.0834 | 0.02752 |
+| Untuned Decision Tree | 10.7124 | -0.0975 |
+| Untuned Random Forest | 7.6184 | 0.4479 |
+| Untuned XGBoost Regressor | 7.6498 | 0.4420 |
+
+As you can see from the metrics, linear models like Lasso performed poorly, as did K Nearest Neighbors and a Decision Tree. The ensemble tree methods of a Random Forest and XGBoost Regressor vastly outperformed the other models. 
+## Iteration
+Based off of the initial models' performance, I chose to iterate on both ensemble tree models. I began with some modest tuning, which slightly improved their performance. The difference is shown below. As before, a full explanation of my process, along with the code required to reproduce my results, can be found in `modeling.qmd`.
+
+|Model|Test RMSE|Test R2|
+|-|-|-|
+|Tuned Random Forest| 7.5385 | 0.4615 |
+|Tuned XGBoost | 7.4013 | 0.4809 |
+
+This was a nice improvement, but I wanted to do better. I was concerned about the high dimensionality of my data, and thought that if I could distill my 756 features into a smaller number of columns I may get better results. My first attempt at this was to simply remove the columns generated from `MultiLabelBinarizer` and `json_normalize` from my training data. The resulting metrics were immediately poorer, and I opted to pursue another angle.
+
+My next attempt involved using sklearn's `TruncatedSVD` to generate new features that captured the variance of `supported_languages`, `full_audio_languages`, `genres`, `categories`, and `tags`. I used `TruncatedSVD` over standard PCA since, unlike PCA, `TruncatedSVD` does not center the data, making it better for sparse data like the data in the columns that I planned to use it on. I also opted to apply `TruncatedSVD` to each of the five groups of columns seperately because I wanted to preserve the domain of group. Trees are already fairly good at identifying interaction effects, and I didn't want to lose out on potentially useful group-specific features. When selecting how many features to return for each group, I made sure that I had enough to capture at least 90% of the variance in the category.
+
+Unfortunately, even after tuning these models still performed worse than my modestly tuned models. Their performance metrics are shown below.
+
+|Model|Test RMSE|Test R2|
+|-|-|-|
+|Random Forest with 90% TruncatedSVD | 7.8614 | 0.4144 |
+|XGBoost with 90% TruncatedSVD | 7.5237 | 0.4636 |
+
+## Final Model
+
+
+In the end, I had a tuned XGBoost Regressor that had a test RMSE of 7.3 and an R2 score of 0.49.
+    
+
+## Interpretation
