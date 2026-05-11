@@ -3,6 +3,7 @@ title: Model Iteration
 author: Reagan Tullis
 execute: 
   cache: true
+  warning: false
 ---
 
 ```{python}
@@ -30,10 +31,10 @@ For my modeling process, I began with running a simple repeated five-fold cross 
 
 The models that ended up having any notable advantage over the dummy regressor were both ensemble tree methods - the Random Forest and the XGBoost Regressor. While a single decison tree performed exceptionally poorly, both of these ensemble methods showed significant improvement over the dummy regressor.
 
-An overview of untuned model performance is shown below. The code for each of these models can be found in the GitHub repository.
+An overview of untuned model performance is shown below. The code for each of these models can be found in `initial_models.qmd`.
 
 #### Untuned Model Performance
-|Model|RMSE|R2|
+|Model|Mean RMSE|Mean R2|
 |-|-|-|
 |Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
 | Untuned Lasso | 9.8811 | 0.0717 |
@@ -46,14 +47,14 @@ An overview of untuned model performance is shown below. The code for each of th
 Based off of the cross-validation results of the initial models, I chose to focus my efforts on tuning and improving both a Random Forest and XGBoost model. An overview of the tuned models' performance is shown in the table below.
 
 #### Model Performance Overview
-|Model|RMSE|R2|
+|Model|Test RMSE|Test R2|
 |-|-|-|
 |Baseline (Dummy Regressor) | 10.2742 | -0.0003 |
-|Random Forest| 7.5385 | 0.4615 |
-|XGBoost | 7.4013 | 0.4809 |
+|Tuned Random Forest| 7.5385 | 0.4615 |
+|Tuned XGBoost | 7.4013 | 0.4809 |
 |Random Forest with 90% TruncatedSVD | 7.8614 | 0.4144 |
 |XGBoost with 90% TruncatedSVD | 7.5237 | 0.4636 |
-|XGBoost (Additional Tuning) | 7.3130 | 0.4932 |
+|Final XGBoost | 7.1278 | 0.5186 |
 
 ### Iteration 1: Tuning
 I began by doing some modest tuning on my prexisting baseline Random Forest and XGBoost Models. This required loading the data from `games_clean.csv` and doing some minor preprocessing to prepare it to be used by my pipelines.
@@ -181,7 +182,7 @@ print("Random Forest RMSE:", rf_rmse)
 This tuning led to a slight improvement over the original Random Forest.
 
 #### XGBoost Tuning
-My XGBoost tuning grid is shown below. I opted to use a randomized search due to number and range of my chosen tuning parameters. 
+My XGBoost tuning grid is shown below. I opted to use a randomized search due to the number and range of my chosen tuning parameters. 
 ```{python}
 # initial XGB pipeline & tuning grid
 xgb_pipe = Pipeline([
@@ -273,7 +274,8 @@ svd.fit(games_pca[cols])
 print(svd.explained_variance_ratio_.cumsum())
 ```
 
-Number of components required to achieve 85%, 95% of variance capture, per feature
+<b> Number of components required to achieve 85%, 95% of variance capture, per feature </b>
+
 |feature | n_components .85 | n_components .9 |
 |-|-|-|
 |lang | 13 | 16 |
@@ -300,6 +302,8 @@ def tag_processor(n_components):
 ```
 
 I tested both 85% and 90% variance `n_components` with simple cross-validation.
+
+##### Preprocessors
 ```{python}
 pca_dt_prep_85 = ColumnTransformer([
     ("ord", dt_ord_prep, pca_ord_features),
@@ -345,6 +349,7 @@ pca_xgb_90_pipe = Pipeline([
 
 ```
 
+##### Cross Validation
 ```{python}
 #| eval: false
 pca_rf_85_cv_results = cross_validate(
@@ -445,10 +450,22 @@ Unfortunately, this approach did not improve my metrics - it actually worsened t
 
 Additionally, while not shown here, I did try models on a dataset that simply did not include the columns that I attempted SVD on. These models also showed a slight decrease in performance compared to the original tuned iteration.
 
-### Iteration 3: Extended XGB Tuning
-For what would become the final notable iteration, I decided to expand the tuning parameter grid of my original XGBoost model to cover additional parameters. This involved a return to the original dataset and feature lists.
+### Iteration 3: Feature Engineering & Extended Tuning
+For what would become the final notable iteration, I decided to expand the tuning parameter grid of my original XGBoost model to cover additional parameters. This involved a return to the original dataset and feature lists. I also engineered a new feature: the ratio of positive to negative user votes.
 
 ```{python}
+games=games.copy()
+games["positive_negative_ratio"] = games["positive"]/(games["negative"]+1)
+num_features += ["positive_negative_ratio"]
+features += ["positive_negative_ratio"]
+
+# reinitialize the sets with the new feature
+games_train, games_test = train_test_split(
+    games,
+    test_size=0.2,
+    random_state=4025
+)
+
 new_xgb_param_grid = {
     "model__n_estimators": np.linspace(300, 1500, 20, dtype=int),
     "model__max_depth": [3, 4, 5, 6, 8],
